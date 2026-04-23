@@ -50,5 +50,7 @@ target_link_libraries(LeviViewModel
     dobby
     android
     log
+    EGL
     GLESv3
+    GLESv2
 )
