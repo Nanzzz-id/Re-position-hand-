@@ -1,247 +1,307 @@
 #include <jni.h>
 #include <android/log.h>
+#include <android/native_window.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <cmath>
-#include <GLES3/gl3.h>
-#include <EGL/egl.h>
+#include <string.h>
+#include <link.h>
+#include <elf.h>
+#include <cstdio>
+#include <cstdarg>
+#include <vector>
+#include <string>
 
+#include "imgui.h"
+#include "imgui_impl_android.h"
+#include "imgui_impl_opengl3.h"
+
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
 #include <dobby.h>
 
 #define LOG_TAG "LeviViewModel"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // ============================================================
-// ✏️  EDIT NILAI DI SINI — sama seperti slider Atlas Client
+// Hasil scan disimpan di sini, ditampilkan di ImGui
 // ============================================================
-
-// -- Displacement (posisi) --
-static float VM_DISP_X =  0.0f;   // kiri/kanan
-static float VM_DISP_Y =  0.0f;   // atas/bawah
-static float VM_DISP_Z = -0.3f;   // depan/belakang (default Atlas: -0.3)
-
-// -- Rotation (rotasi dalam derajat) --
-static float VM_ROT_X  =  0.0f;
-static float VM_ROT_Y  =  0.0f;
-static float VM_ROT_Z  =  0.0f;
-
-// -- Scale (ukuran) --
-static float VM_SCALE_X = 1.2f;   // default Atlas: 1.2
-static float VM_SCALE_Y = 1.2f;   // default Atlas: 1.2
-static float VM_SCALE_Z = 2.0f;   // default Atlas: 2.0
+static std::vector<std::string> g_found_symbols;
+static std::string              g_status = "Scanning...";
+static bool                     g_scan_done = false;
 
 // ============================================================
+// EGL / ImGui state
+// ============================================================
+static bool        g_imgui_init    = false;
+static ANativeWindow* g_native_win = nullptr;
+static EGLContext  g_egl_ctx       = EGL_NO_CONTEXT;
+static EGLSurface  g_egl_surf      = EGL_NO_SURFACE;
+static int         g_width = 0, g_height = 0;
+
+static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface)                                         = nullptr;
+static EGLSurface (*orig_eglCreateWindowSurface)(EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint*) = nullptr;
 
 // ============================================================
-// Matrix 4x4 helper (kolom-major, standar OpenGL)
+// Hook eglCreateWindowSurface — capture ANativeWindow
 // ============================================================
-struct Mat4 {
-    float m[16];
+static EGLSurface hook_eglCreateWindowSurface(
+    EGLDisplay dpy, EGLConfig cfg, EGLNativeWindowType win, const EGLint* attr)
+{
+    g_native_win = (ANativeWindow*)win;
+    LOGI("ANativeWindow captured.");
+    return orig_eglCreateWindowSurface(dpy, cfg, win, attr);
+}
 
-    static Mat4 identity() {
-        Mat4 r = {};
-        r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
-        return r;
+// ============================================================
+// Setup ImGui
+// ============================================================
+static void setup_imgui() {
+    if (g_imgui_init || !g_native_win || g_width <= 0) return;
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.FontGlobalScale = 1.8f; // Besar agar mudah dibaca
+    ImGui_ImplAndroid_Init(g_native_win);
+    ImGui_ImplOpenGL3_Init("#version 300 es");
+    g_imgui_init = true;
+    LOGI("ImGui initialized.");
+}
+
+// ============================================================
+// Render overlay — tampilkan hasil scan
+// ============================================================
+static void render_overlay() {
+    if (!g_imgui_init) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)g_width, (float)g_height);
+
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplAndroid_NewFrame();
+    ImGui::NewFrame();
+
+    // Window selebar layar, transparan sebagian
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImVec2((float)g_width, (float)g_height));
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    ImGui::Begin("LeviViewModel Symbol Finder", nullptr,
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_HorizontalScrollbar);
+
+    ImGui::TextColored(ImVec4(0,1,1,1), "=== LeviViewModel Diagnostic ===");
+    ImGui::TextColored(ImVec4(1,1,0,1), "MC 1.26.13.1  |  arm64");
+    ImGui::Separator();
+
+    ImGui::Text("Status: %s", g_status.c_str());
+    ImGui::Separator();
+
+    if (g_found_symbols.empty() && g_scan_done) {
+        ImGui::TextColored(ImVec4(1,0,0,1), "Tidak ada symbol ditemukan!");
+        ImGui::TextColored(ImVec4(1,0.5f,0,1), "Library kemungkinan stripped.");
+        ImGui::TextColored(ImVec4(1,0.5f,0,1), "Perlu pattern scan.");
+    } else {
+        ImGui::TextColored(ImVec4(0,1,0,1), "Symbols ditemukan (%d):", (int)g_found_symbols.size());
+        ImGui::Separator();
+        for (auto& sym : g_found_symbols) {
+            ImGui::TextWrapped("%s", sym.c_str());
+            ImGui::Separator();
+        }
     }
 
-    static Mat4 translate(float x, float y, float z) {
-        Mat4 r = identity();
-        r.m[12] = x; r.m[13] = y; r.m[14] = z;
-        return r;
-    }
+    ImGui::End();
 
-    static Mat4 scale(float x, float y, float z) {
-        Mat4 r = identity();
-        r.m[0] = x; r.m[5] = y; r.m[10] = z;
-        return r;
-    }
+    ImGui::Render();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+}
 
-    static Mat4 rotateX(float deg) {
-        float rad = deg * (float)M_PI / 180.0f;
-        Mat4 r = identity();
-        r.m[5]  =  cosf(rad); r.m[9]  = -sinf(rad);
-        r.m[6]  =  sinf(rad); r.m[10] =  cosf(rad);
-        return r;
-    }
+// ============================================================
+// Hook eglSwapBuffers
+// ============================================================
+static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
+    if (!orig_eglSwapBuffers) return EGL_FALSE;
 
-    static Mat4 rotateY(float deg) {
-        float rad = deg * (float)M_PI / 180.0f;
-        Mat4 r = identity();
-        r.m[0]  =  cosf(rad); r.m[8]  =  sinf(rad);
-        r.m[2]  = -sinf(rad); r.m[10] =  cosf(rad);
-        return r;
-    }
+    EGLContext ctx = eglGetCurrentContext();
+    if (ctx == EGL_NO_CONTEXT) return orig_eglSwapBuffers(dpy, surf);
 
-    static Mat4 rotateZ(float deg) {
-        float rad = deg * (float)M_PI / 180.0f;
-        Mat4 r = identity();
-        r.m[0]  =  cosf(rad); r.m[4]  = -sinf(rad);
-        r.m[1]  =  sinf(rad); r.m[5]  =  cosf(rad);
-        return r;
-    }
+    EGLint w, h;
+    eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
+    eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+    if (w <= 0 || h <= 0) return orig_eglSwapBuffers(dpy, surf);
 
-    // Perkalian matrix: this * b
-    Mat4 operator*(const Mat4& b) const {
-        Mat4 out = {};
-        for (int col = 0; col < 4; col++) {
-            for (int row = 0; row < 4; row++) {
-                for (int k = 0; k < 4; k++) {
-                    out.m[col*4 + row] += m[k*4 + row] * b.m[col*4 + k];
+    if (g_egl_ctx == EGL_NO_CONTEXT) {
+        g_egl_ctx  = ctx;
+        g_egl_surf = surf;
+    }
+    if (ctx != g_egl_ctx || surf != g_egl_surf)
+        return orig_eglSwapBuffers(dpy, surf);
+
+    g_width  = w;
+    g_height = h;
+
+    setup_imgui();
+    render_overlay();
+
+    return orig_eglSwapBuffers(dpy, surf);
+}
+
+// ============================================================
+// Scan ELF untuk symbol yang relevan
+// ============================================================
+static void do_symbol_scan() {
+    // Cari path via /proc/self/maps
+    char mc_path[512] = {};
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (maps) {
+        char line[1024];
+        while (fgets(line, sizeof(line), maps)) {
+            if (strstr(line, "libminecraftpe.so")) {
+                char* p = strchr(line, '/');
+                if (p) {
+                    size_t len = strlen(p);
+                    while (len > 0 && (p[len-1] == '\n' || p[len-1] == '\r'))
+                        p[--len] = 0;
+                    strncpy(mc_path, p, sizeof(mc_path)-1);
+                    break;
                 }
             }
         }
-        return out;
+        fclose(maps);
     }
-};
 
-// ============================================================
-// Fungsi pointer untuk eglSwapBuffers dan glUniformMatrix4fv
-// ============================================================
-static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
-static void       (*orig_glUniformMatrix4fv)(GLint, GLsizei, GLboolean, const GLfloat*) = nullptr;
-
-// State untuk intercept uniform matrix
-static bool  g_in_hand_render    = false;
-static bool  g_matrix_patched    = false;
-static GLint g_mvp_uniform_loc   = -1;
-static GLuint g_last_program     = 0;
-
-// ============================================================
-// Hook glUniformMatrix4fv
-// Intercept upload MVP matrix dan inject transform tangan
-// ============================================================
-void hook_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value) {
-    if (g_in_hand_render && !g_matrix_patched && count == 1) {
-        // Bangun transform kita: T * Rx * Ry * Rz * S
-        Mat4 T  = Mat4::translate(VM_DISP_X, VM_DISP_Y, VM_DISP_Z);
-        Mat4 Rx = Mat4::rotateX(VM_ROT_X);
-        Mat4 Ry = Mat4::rotateY(VM_ROT_Y);
-        Mat4 Rz = Mat4::rotateZ(VM_ROT_Z);
-        Mat4 S  = Mat4::scale(VM_SCALE_X, VM_SCALE_Y, VM_SCALE_Z);
-
-        // Original matrix dari game
-        Mat4 orig;
-        for (int i = 0; i < 16; i++) orig.m[i] = value[i];
-
-        // Terapkan transform kita di atas matrix asli: orig * T * Rx * Ry * Rz * S
-        Mat4 result = orig * T * Rx * Ry * Rz * S;
-
-        g_matrix_patched = true;
-        orig_glUniformMatrix4fv(location, count, transpose, result.m);
+    if (!mc_path[0]) {
+        g_status = "ERROR: Path libminecraftpe tidak ditemukan!";
+        g_scan_done = true;
         return;
     }
 
-    orig_glUniformMatrix4fv(location, count, transpose, value);
-}
+    g_status = std::string("Scanning: ") + mc_path;
+    LOGI("Scanning: %s", mc_path);
 
-// ============================================================
-// Pointer ke renderItemInHand asli
-// ============================================================
-void (*orig_renderItemInHand)(
-    void* self, void* player, float partialTicks, float pitch,
-    void* hand, float swingProgress, void* itemStack, float equippedProgress
-) = nullptr;
+    FILE* f = fopen(mc_path, "rb");
+    if (!f) {
+        g_status = "ERROR: Tidak bisa buka ELF file!";
+        g_scan_done = true;
+        return;
+    }
 
-// ============================================================
-// Hook renderItemInHand
-// Set flag sebelum/sesudah render agar glUniformMatrix4fv
-// tahu kapan harus intercept
-// ============================================================
-void hook_renderItemInHand(
-    void* self, void* player, float partialTicks, float pitch,
-    void* hand, float swingProgress, void* itemStack, float equippedProgress
-) {
-    g_in_hand_render  = true;
-    g_matrix_patched  = false;
+    Elf64_Ehdr ehdr;
+    fread(&ehdr, sizeof(ehdr), 1, f);
+    if (ehdr.e_ident[0] != 0x7f) {
+        g_status = "ERROR: Bukan file ELF valid!";
+        fclose(f); g_scan_done = true; return;
+    }
 
-    orig_renderItemInHand(
-        self, player, partialTicks, pitch,
-        hand, swingProgress, itemStack, equippedProgress
-    );
+    fseek(f, (long)ehdr.e_shoff, SEEK_SET);
+    Elf64_Shdr* shdrs = new Elf64_Shdr[ehdr.e_shnum];
+    fread(shdrs, sizeof(Elf64_Shdr), ehdr.e_shnum, f);
 
-    g_in_hand_render = false;
-    g_matrix_patched = false;
-}
+    Elf64_Shdr* dynsym_sh = nullptr;
+    Elf64_Shdr* dynstr_sh = nullptr;
+    for (int i = 0; i < ehdr.e_shnum; i++) {
+        if (shdrs[i].sh_type == SHT_DYNSYM) dynsym_sh = &shdrs[i];
+        if (shdrs[i].sh_type == SHT_STRTAB && i != ehdr.e_shstrndx && !dynstr_sh)
+            dynstr_sh = &shdrs[i];
+    }
 
-// ============================================================
-// Hook eglSwapBuffers — hanya untuk log ukuran layar (opsional)
-// ============================================================
-static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    return orig_eglSwapBuffers(dpy, surf);
+    if (!dynsym_sh || !dynstr_sh) {
+        g_status = "ERROR: Section dynsym/dynstr tidak ada (mungkin stripped)";
+        delete[] shdrs; fclose(f); g_scan_done = true; return;
+    }
+
+    char* strtab = new char[dynstr_sh->sh_size];
+    fseek(f, (long)dynstr_sh->sh_offset, SEEK_SET);
+    fread(strtab, 1, dynstr_sh->sh_size, f);
+
+    int nsym = (int)(dynsym_sh->sh_size / sizeof(Elf64_Sym));
+    Elf64_Sym* syms = new Elf64_Sym[nsym];
+    fseek(f, (long)dynsym_sh->sh_offset, SEEK_SET);
+    fread(syms, sizeof(Elf64_Sym), nsym, f);
+
+    const char* kw[] = {
+        "renderItem", "ItemInHand", "HandRender",
+        "HeldItem",   "ViewModel",  "viewModel",
+        "renderHand", "ItemRender", "HandModel",
+        "firstPerson","FirstPerson","InHandRend"
+    };
+    const int nkw = 12;
+
+    for (int i = 0; i < nsym; i++) {
+        const char* name = strtab + syms[i].st_name;
+        if (!name || !*name) continue;
+        for (int k = 0; k < nkw; k++) {
+            if (strstr(name, kw[k])) {
+                g_found_symbols.push_back(std::string(name));
+                LOGI("SYM: %s", name);
+                break;
+            }
+        }
+    }
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Scan selesai. %d symbols ditemukan.", (int)g_found_symbols.size());
+    g_status = buf;
+
+    delete[] syms;
+    delete[] strtab;
+    delete[] shdrs;
+    fclose(f);
+    g_scan_done = true;
 }
 
 // ============================================================
 // Thread utama
 // ============================================================
 static void* main_mod_thread(void*) {
-    LOGI("=== LeviViewModel Mod Thread Started ===");
-    sleep(5);
+    LOGI("Thread started.");
+    sleep(3);
 
-    // --- Hook eglSwapBuffers (opsional, bisa dihapus jika tidak perlu) ---
-    void* egl_handle = dlopen("libEGL.so", RTLD_LAZY);
-    if (egl_handle) {
-        void* sym = dlsym(egl_handle, "eglSwapBuffers");
-        if (sym) {
-            DobbyHook(sym, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-            LOGI("Hooked eglSwapBuffers.");
-        }
+    // Hook EGL
+    void* egl = dlopen("libEGL.so", RTLD_LAZY);
+    if (egl) {
+        void* sym;
+        sym = dlsym(egl, "eglSwapBuffers");
+        if (sym) DobbyHook(sym, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+        sym = dlsym(egl, "eglCreateWindowSurface");
+        if (sym) DobbyHook(sym, (void*)hook_eglCreateWindowSurface, (void**)&orig_eglCreateWindowSurface);
+        LOGI("EGL hooked.");
     }
 
-    // --- Hook glUniformMatrix4fv ---
-    void* gles_handle = dlopen("libGLESv3.so", RTLD_LAZY);
-    if (!gles_handle) gles_handle = dlopen("libGLESv2.so", RTLD_LAZY);
-    if (gles_handle) {
-        void* sym = dlsym(gles_handle, "glUniformMatrix4fv");
-        if (sym) {
-            DobbyHook(sym, (void*)hook_glUniformMatrix4fv, (void**)&orig_glUniformMatrix4fv);
-            LOGI("Hooked glUniformMatrix4fv.");
-        } else {
-            LOGI("ERROR: glUniformMatrix4fv symbol tidak ditemukan.");
-        }
+    // Tunggu sampai ImGui siap, baru scan
+    int wait = 0;
+    while (!g_imgui_init && wait < 60) {
+        sleep(1); wait++;
+    }
+
+    if (g_imgui_init) {
+        g_status = "Scanning symbols...";
+        do_symbol_scan();
     } else {
-        LOGI("ERROR: libGLESv3.so / libGLESv2.so tidak bisa dibuka.");
-    }
-
-    // --- Hook renderItemInHand ---
-    void* mcpe = dlopen("libminecraftpe.so", RTLD_LAZY);
-    if (!mcpe) {
-        LOGI("ERROR: libminecraftpe.so tidak bisa dibuka.");
-        return nullptr;
-    }
-
-    const char* sym = "_ZN18ItemInHandRenderer16renderItemInHandEP6PlayerffffRK9ItemStackf";
-    void* target = dlsym(mcpe, sym);
-    if (!target) {
-        LOGI("ERROR: Symbol renderItemInHand tidak ditemukan. Cek versi MC.");
-        return nullptr;
-    }
-
-    int res = DobbyHook(target, (void*)hook_renderItemInHand, (void**)&orig_renderItemInHand);
-    if (res == 0) {
-        LOGI("SUCCESS: Hook renderItemInHand aktif!");
-        LOGI("Config: Disp(%.2f, %.2f, %.2f) Rot(%.1f, %.1f, %.1f) Scale(%.2f, %.2f, %.2f)",
-             VM_DISP_X, VM_DISP_Y, VM_DISP_Z,
-             VM_ROT_X,  VM_ROT_Y,  VM_ROT_Z,
-             VM_SCALE_X, VM_SCALE_Y, VM_SCALE_Z);
-    } else {
-        LOGI("ERROR: DobbyHook gagal, code: %d", res);
+        g_status = "ERROR: ImGui tidak bisa init (EGL/window issue)";
+        g_scan_done = true;
+        LOGI("ImGui init timeout!");
     }
 
     return nullptr;
 }
 
 // ============================================================
+// Input handling sederhana
+// ============================================================
+typedef bool (*TouchCb)(int, int, float, float);
+struct InputIface { void (*reg)(TouchCb); };
+typedef InputIface* (*GetInput)();
+
+// ============================================================
 // Entry point
 // ============================================================
 __attribute__((constructor))
 void mod_entry_point() {
-    LOGI("=== LeviViewModel Mod Loaded ===");
+    LOGI("=== LeviViewModel Diagnostic Loaded ===");
     pthread_t t;
     pthread_create(&t, nullptr, main_mod_thread, nullptr);
 }
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
-    LOGI("JNI_OnLoad called.");
     return JNI_VERSION_1_6;
 }
