@@ -2,10 +2,11 @@
 #include <string>
 #include <vector>
 #include <android/log.h>
-#include <android/input.h> // Untuk AMOTION_EVENT_ACTION_DOWN/UP
+#include <android/input.h>
+#include <android/native_window.h>
 #include <dlfcn.h>
-#include <pthread.h> // Untuk threading
-#include <unistd.h>  // Untuk sleep
+#include <pthread.h>
+#include <unistd.h>
 
 // ImGui Headers
 #include "imgui.h"
@@ -24,7 +25,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // ===========================================================================
-// Variabel Global dan State Mod Anda
+// Variabel Global dan State Mod
 // ===========================================================================
 struct HandOffset {
     float x = 0.0f;
@@ -35,8 +36,6 @@ struct HandOffset {
 bool g_showMenu = true;
 
 // Pointer ke fungsi asli ItemInHandRenderer::renderItemInHand
-// Signature ini mungkin perlu disesuaikan dengan versi Minecraft Bedrock yang Anda targetkan.
-// Anda mungkin perlu melakukan reverse engineering lebih lanjut untuk mendapatkan signature yang tepat.
 void (*orig_ItemInHandRenderer_renderItemInHand)(
     void* self, void* player, float partialTicks, float pitch,
     void* hand, float swingProgress, void* itemStack, float equippedProgress
@@ -47,27 +46,11 @@ void hook_ItemInHandRenderer_renderItemInHand(
     void* self, void* player, float partialTicks, float pitch,
     void* hand, float swingProgress, void* itemStack, float equippedProgress
 ) {
-    // --- Logika Modifikasi Posisi Tangan --- 
-    // Ini adalah bagian yang paling menantang dan sangat bergantung pada implementasi internal game.
-    // Secara umum, Anda perlu menemukan cara untuk memodifikasi matriks transformasi yang digunakan
-    // untuk merender item di tangan. Ini bisa berarti:
-    // 1. Mencari parameter di 'self' atau 'player' yang mengontrol transformasi.
-    // 2. Menggunakan Dobby untuk hook fungsi OpenGL ES yang relevan (misalnya glTranslate, glRotate)
-    //    yang dipanggil oleh renderItemInHand dan menyuntikkan offset Anda di sana.
-    // 3. Mengubah nilai di memori yang digunakan oleh game untuk posisi tangan.
-    //
-    // Sebagai placeholder, kita akan mencetak offset dan memanggil fungsi asli.
-    // Untuk implementasi nyata, Anda perlu melakukan reverse engineering lebih lanjut.
     LOGI("Hand Offset: x=%.2f, y=%.2f, z=%.2f", g_handOffset.x, g_handOffset.y, g_handOffset.z);
-
-    // Contoh hipotesis: Jika ada cara untuk memodifikasi matriks model-view sebelum rendering
-    // glMatrixMode(GL_MODELVIEW);
-    // glPushMatrix();
-    // glTranslatef(g_handOffset.x, g_handOffset.y, g_handOffset.z);
-    
-    orig_ItemInHandRenderer_renderItemInHand(self, player, partialTicks, pitch, hand, swingProgress, itemStack, equippedProgress);
-
-    // glPopMatrix(); // Jika glPushMatrix() dipanggil
+    orig_ItemInHandRenderer_renderItemInHand(
+        self, player, partialTicks, pitch,
+        hand, swingProgress, itemStack, equippedProgress
+    );
 }
 
 // ===========================================================================
@@ -77,38 +60,56 @@ static bool g_imgui_initialized = false;
 static int g_display_width = 0, g_display_height = 0;
 static EGLContext g_target_egl_context = EGL_NO_CONTEXT;
 static EGLSurface g_target_egl_surface = EGL_NO_SURFACE;
-static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
+static ANativeWindow* g_native_window = nullptr;
 
-// Fungsi untuk menggambar menu ImGui Anda
+static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
+static EGLSurface (*orig_eglCreateWindowSurface)(EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint*) = nullptr;
+
+// Hook eglCreateWindowSurface untuk capture ANativeWindow*
+static EGLSurface hook_eglCreateWindowSurface(
+    EGLDisplay dpy, EGLConfig config,
+    EGLNativeWindowType win, const EGLint* attribs
+) {
+    g_native_window = (ANativeWindow*)win;
+    LOGI("Captured ANativeWindow from eglCreateWindowSurface.");
+    return orig_eglCreateWindowSurface(dpy, config, win, attribs);
+}
+
+// Fungsi untuk menggambar menu ImGui
 void DrawMenu() {
     if (!g_showMenu) return;
 
+    ImGui::SetNextWindowSize(ImVec2(320, 200), ImGuiCond_FirstUseEver);
     ImGui::Begin("Levi Hand ViewModel", &g_showMenu);
     ImGui::Text("Adjust Hand Position (Real-time)");
-    
+    ImGui::Separator();
+
     ImGui::SliderFloat("Offset X", &g_handOffset.x, -2.0f, 2.0f);
     ImGui::SliderFloat("Offset Y", &g_handOffset.y, -2.0f, 2.0f);
     ImGui::SliderFloat("Offset Z", &g_handOffset.z, -2.0f, 2.0f);
 
-    if (ImGui::Button("Reset")) {
+    ImGui::Spacing();
+    if (ImGui::Button("Reset", ImVec2(80, 30))) {
         g_handOffset = {0.0f, 0.0f, 0.0f};
     }
-    
+
     ImGui::End();
 }
 
 static void setup_imgui() {
-    if (g_imgui_initialized || g_display_width <= 0 || g_display_height <= 0) return;
+    // Tunggu sampai semua syarat terpenuhi
+    if (g_imgui_initialized || g_display_width <= 0 || g_display_height <= 0 || !g_native_window) return;
+
     LOGI("Initializing ImGui context...");
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr; // Jangan simpan konfigurasi ImGui ke file
-    io.FontGlobalScale = 1.5f; // Sesuaikan skala font jika perlu
 
-    // Inisialisasi backend ImGui untuk Android dan OpenGL3
-    ImGui_ImplAndroid_Init();
-    // Gunakan #version 300 es jika Minecraft menggunakan GLES 3.0+, atau #version 100 es untuk GLES 2.0
-    ImGui_ImplOpenGL3_Init("#version 300 es"); 
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.FontGlobalScale = 1.5f;
+
+    // ✅ Fix 1: ImGui_ImplAndroid_Init sekarang pakai g_native_window
+    ImGui_ImplAndroid_Init(g_native_window);
+    ImGui_ImplOpenGL3_Init("#version 300 es");
 
     g_imgui_initialized = true;
     LOGI("ImGui context initialized successfully.");
@@ -142,13 +143,11 @@ static void render_imgui() {
 
     // Mulai frame ImGui baru
     ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(g_display_width, g_display_height); // Perlu width, height
+    ImGui_ImplAndroid_NewFrame(); // ✅ Fix 2: hapus argumen width/height
     ImGui::NewFrame();
 
-    // Panggil fungsi gambar menu Anda
     DrawMenu();
 
-    // Render ImGui
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -173,9 +172,8 @@ static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     if (!orig_eglSwapBuffers) return EGL_FALSE;
 
     EGLContext current_context = eglGetCurrentContext();
-    // Pastikan kita berada di konteks yang benar
-    if (current_context == EGL_NO_CONTEXT || 
-        (g_target_egl_context != EGL_NO_CONTEXT && 
+    if (current_context == EGL_NO_CONTEXT ||
+        (g_target_egl_context != EGL_NO_CONTEXT &&
          (current_context != g_target_egl_context || surf != g_target_egl_surface))) {
         return orig_eglSwapBuffers(dpy, surf);
     }
@@ -184,12 +182,10 @@ static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
 
-    // Abaikan permukaan yang terlalu kecil atau tidak valid
     if (w <= 0 || h <= 0) {
         return orig_eglSwapBuffers(dpy, surf);
     }
 
-    // Set target context dan surface jika belum diset
     if (g_target_egl_context == EGL_NO_CONTEXT) {
         g_target_egl_context = current_context;
         g_target_egl_surface = surf;
@@ -199,8 +195,8 @@ static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     g_display_width = w;
     g_display_height = h;
 
-    setup_imgui(); // Inisialisasi ImGui jika belum
-    render_imgui(); // Render ImGui GUI
+    setup_imgui();
+    render_imgui();
 
     return orig_eglSwapBuffers(dpy, surf);
 }
@@ -208,7 +204,6 @@ static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
 // ===========================================================================
 // Input Handling untuk ImGui
 // ===========================================================================
-// Struktur dan typedef dari libpreloader.so
 typedef bool (*PreloaderInput_OnTouch_Fn)(int action, int pointerId, float x, float y);
 
 struct PreloaderInput_Interface {
@@ -219,55 +214,62 @@ typedef PreloaderInput_Interface* (*GetPreloaderInput_Fn)();
 
 bool OnTouchCallback(int action, int pointerId, float x, float y) {
     if (!g_imgui_initialized) return false;
-    
+
     ImGuiIO& io = ImGui::GetIO();
-    // Perbarui posisi mouse/sentuhan
-    // ImGui_ImplAndroid_HandleInputEvent() mungkin lebih baik jika tersedia
     io.AddMousePosEvent(x, y);
-    
-    // Perbarui status tombol mouse/sentuhan
+
     if (action == AMOTION_EVENT_ACTION_DOWN) {
         io.AddMouseButtonEvent(0, true);
     } else if (action == AMOTION_EVENT_ACTION_UP) {
         io.AddMouseButtonEvent(0, false);
-    } else if (action == AMOTION_EVENT_ACTION_MOVE) {
-        // ImGui secara otomatis menangani pergerakan mouse jika posisi diperbarui
     }
 
-    // Jika ImGui ingin menangkap input, kembalikan true untuk mencegah game memprosesnya
     return io.WantCaptureMouse;
 }
 
 // ===========================================================================
-// Entry Point Mod (Constructor dan Threading)
+// Entry Point Mod
 // ===========================================================================
 static void* main_mod_thread(void*) {
     LOGI("Mod thread started. Waiting for game initialization...");
-    sleep(5); // Beri waktu game untuk inisialisasi
+    sleep(5);
 
-    // Hook eglSwapBuffers menggunakan Dobby
     void* egl_handle = dlopen("libEGL.so", RTLD_LAZY);
     if (egl_handle) {
+        // Hook eglSwapBuffers
         void* eglSwapBuffers_sym = dlsym(egl_handle, "eglSwapBuffers");
         if (eglSwapBuffers_sym) {
             DobbyHook(eglSwapBuffers_sym, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-            LOGI("Hooked eglSwapBuffers successfully using Dobby!");
+            LOGI("Hooked eglSwapBuffers successfully!");
         } else {
             LOGI("Failed to find eglSwapBuffers symbol.");
+        }
+
+        // ✅ Fix 3: Hook eglCreateWindowSurface untuk capture ANativeWindow*
+        void* eglCreateWindowSurface_sym = dlsym(egl_handle, "eglCreateWindowSurface");
+        if (eglCreateWindowSurface_sym) {
+            DobbyHook(eglCreateWindowSurface_sym, (void*)hook_eglCreateWindowSurface, (void**)&orig_eglCreateWindowSurface);
+            LOGI("Hooked eglCreateWindowSurface successfully!");
+        } else {
+            LOGI("Failed to find eglCreateWindowSurface symbol.");
         }
     } else {
         LOGI("Failed to open libEGL.so.");
     }
 
-    // Hook ItemInHandRenderer::renderItemInHand (mod Anda)
+    // Hook ItemInHandRenderer::renderItemInHand
     void* mcpe_handle = dlopen("libminecraftpe.so", RTLD_LAZY);
     if (mcpe_handle) {
-        // Pastikan signature fungsi ini benar untuk versi Minecraft Anda
-        // Contoh signature dari referensi lain: _ZN18ItemInHandRenderer16renderItemInHandEP6PlayerffffRK9ItemStackf
-        // Anda mungkin perlu menyesuaikan ini.
-        void* target_render_item = dlsym(mcpe_handle, "_ZN18ItemInHandRenderer16renderItemInHandEP6PlayerffffRK9ItemStackf");
+        void* target_render_item = dlsym(
+            mcpe_handle,
+            "_ZN18ItemInHandRenderer16renderItemInHandEP6PlayerffffRK9ItemStackf"
+        );
         if (target_render_item) {
-            DobbyHook(target_render_item, (void*)hook_ItemInHandRenderer_renderItemInHand, (void**)&orig_ItemInHandRenderer_renderItemInHand);
+            DobbyHook(
+                target_render_item,
+                (void*)hook_ItemInHandRenderer_renderItemInHand,
+                (void**)&orig_ItemInHandRenderer_renderItemInHand
+            );
             LOGI("Hooked renderItemInHand successfully!");
         } else {
             LOGI("Failed to find renderItemInHand symbol. Check function signature.");
@@ -276,7 +278,7 @@ static void* main_mod_thread(void*) {
         LOGI("Failed to open libminecraftpe.so.");
     }
 
-    // Hook input handling dari libpreloader.so
+    // Hook input dari libpreloader.so
     void* preloader_lib = dlopen("libpreloader.so", RTLD_NOW);
     if (preloader_lib) {
         GetPreloaderInput_Fn GetInput = (GetPreloaderInput_Fn)dlsym(preloader_lib, "GetPreloaderInput");
@@ -296,18 +298,13 @@ static void* main_mod_thread(void*) {
     return nullptr;
 }
 
-// Fungsi constructor yang akan dipanggil saat library dimuat
 __attribute__((constructor))
 void mod_entry_point() {
     pthread_t t;
     pthread_create(&t, nullptr, main_mod_thread, nullptr);
 }
 
-// JNI_OnLoad bisa tetap ada jika Levi Launcher memerlukannya, 
-// tetapi inisialisasi utama dipindahkan ke thread terpisah.
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     LOGI("JNI_OnLoad called by LeviLauncher!");
-    // Anda bisa menambahkan inisialisasi ringan di sini jika perlu,
-    // tetapi inisialisasi berat dan hooking sebaiknya di thread terpisah.
     return JNI_VERSION_1_6;
 }
