@@ -1,0 +1,8 @@
+{
+  "name": "LeviViewModel",
+  "version": "1.0.0",
+  "description": "Real-time hand position (ViewModel) changer for Minecraft Bedrock.",
+  "author": "Nanzzz",
+  "entry": "libLeviViewModel.so",
+  "dependencies": []
+}
