@@ -4,26 +4,26 @@ project("LeviViewModel" LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Optimization flags untuk menghindari error assembler pada NDK baru
+# Optimization flags & Warning suppression
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -w")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -fvisibility=hidden -ffunction-sections -fdata-sections")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -w")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections,--strip-all -s")
 
 # Konfigurasi Dobby sebelum FetchContent
+# Menggunakan fork neomloader yang sudah mengganti file .asm dengan runtime assembly (TurboAssembler)
 set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
 set(DOBBY_BUILD_FOR_ANDROID ON CACHE BOOL "" FORCE)
 set(DOBBY_DEBUG OFF CACHE BOOL "" FORCE)
 
-# Mengunduh Dobby secara otomatis
 include(FetchContent)
 FetchContent_Declare(
     dobby
-    GIT_REPOSITORY https://github.com/jmpews/Dobby.git
-    GIT_TAG master
+    GIT_REPOSITORY https://github.com/neomloader/Dobby.git
+    GIT_TAG main
 )
 FetchContent_MakeAvailable(dobby)
 
-# Folder include untuk ImGui dan Dobby
+# Folder include
 include_directories(
     include
     include/backends
@@ -45,7 +45,7 @@ add_library(LeviViewModel SHARED
     ${IMGUI_SOURCES}
 )
 
-# Link library yang dibutuhkan
+# Link library
 target_link_libraries(LeviViewModel
     dobby
     android
